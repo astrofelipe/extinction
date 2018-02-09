@@ -9,9 +9,10 @@ import airballoon
 #import time
 import numpy as np
 from joblib import Parallel, delayed
-from photutils import DAOStarFinder, CircularAperture, CircularAnnulus, aperture_photometry
+from photutils import DAOStarFinder, CircularAperture, CircularAnnulus, aperture_photometry, SExtractorBackground
 from astropy.io import fits
 from astropy.utils.console import color_print, ProgressBar
+from astropy.stats import sigma_clipped_stats, SigmaClip
 from utils import altaz2xy
 from locations import locations
 
@@ -34,7 +35,7 @@ print '\tBuscando archivos fits'
 all_fits = np.sort(glob.glob('%s*.fits*' % args.Folder))
 print '\tEncontrados %d archivos' % len(all_fits)
 print '\tLeyendo headers...'
-all_head = [fits.getheader(f, 1) for f in ProgressBar(all_fits)]#Parallel(n_jobs=4, verbose=0)(delayed(fits.getheader)(f) for f in all_fits)
+all_head = Parallel(n_jobs=4, verbose=5)(delayed(fits.getheader)(f,1) for f in all_fits)
 dates    = np.array([ephem.Date(h['DATE']+ ' ' + h['UT']) for h in all_head])
 loc.date = dates[0]
 
@@ -62,7 +63,7 @@ print '\t\tPrimera imagen: ' + all_fits[0]
 print '\t\tUltima imagen:  ' + all_fits[-1]
 
 print '\tLeyendo datos...'
-all_data = np.array(Parallel(n_jobs=4, verbose=0)(delayed(fits.getdata)(f) for f in all_fits))#np.array([fits.getdata(f) for f in ProgressBar(all_fits)])#np.array(Parallel(n_jobs=4, verbose=0)(delayed(fits.getdata)(f) for f in all_fits))
+all_data = np.array(Parallel(n_jobs=4, verbose=5)(delayed(fits.getdata)(f) for f in all_fits))#np.array([fits.getdata(f) for f in ProgressBar(all_fits)])#np.array(Parallel(n_jobs=4, verbose=0)(delayed(fits.getdata)(f) for f in all_fits))
 
 if args.manual:
     import matplotlib.pyplot as plt
@@ -102,6 +103,8 @@ dateflo = np.zeros(noche.sum())
 datetim = []
 
 YY, XX = np.ogrid[:all_data[0].shape[0], :all_data[0].shape[1]]
+sigma_clip = SigmaClip(sigma=3)
+
 for i in ProgressBar(noche.sum()):
     loc.date = dates[noche][i]
     star.compute(loc)
@@ -115,24 +118,38 @@ for i in ProgressBar(noche.sum()):
     nowhead = fits.getheader(all_fits[i], 1)
  
     pedestal = nowhead['PEDESTAL']
-    egain    = nowhead['EGAIN']
-    exptime  = nowhead['EXPTIME']
+    egain    = float(nowhead['EGAIN'])
+    exptime  = float(nowhead['EXPTIME'])
 
-    nowdata = egain * (nowdata + pedestal) / exptime
+    nowdata = nowdata + pedestal
+    nowdata[nowdata < 0] = 0
+    nowdata = nowdata / exptime
 
     #Background
     bdist = np.sqrt((XX - x[i])**2 + (YY - y[i])**2)
-    bmask = (bdist > 5.) * (bdist < 20.)
-    bkg   = np.nanmedian(nowdata[bmask])
+    bmask = (bdist < 10.)# * (bdist > 4.)
+
+    for j in range(30):
+        btest = (bdist < 6+j)
+        mtest, vtest, _ = sigma_clipped_stats(nowdata[btest], sigma=3.0, iters=5)
+        print mtest, vtest    
+    
+    bkgf = SExtractorBackground(sigma_clip)
+    bkg  = bkgf(nowdata[bmask])
+    #mean, bkg, std = sigma_clipped_stats(nowdata[bmask], sigma=3.0, iters=5)
+    #bkg   = np.nanmedian(nowdata[bmask])
     #print bkg, np.nanmean(nowdata[bmask]), np.nanstd(nowdata[bmask])
     
-    apstar    = CircularAperture([x[i],y[i]], r=5.)
+    apstar    = [CircularAperture([x[i],y[i]], r=r) for r in range(3,20)]
+    nobkdata  = nowdata - bkg
+    nobkdata[nobkdata < 0] = 0
     #anstar    = CircularAnnulus([x,y], r_in=5., r_out=10.)
     #apertures = [apstar, anstar]
     #print annulus
-    phot_table = aperture_photometry(nowdata - bkg, apstar)
+    phot_table = aperture_photometry(nobkdata, apstar)
+    print '\n',phot_table,'\n', aperture_photometry(nowdata, apstar),'\n', bkg,'\n'
     #bkg_mean   = phot_table['aperture_sum_1'] / anstar.area()
-    flux[i]    = phot_table['aperture_sum']
+    flux[i]    = phot_table['aperture_sum_2']*egain
     airmass[i] = airballoon.airmass(el*180.0/np.pi, 0) if el > 0 else np.nan#1.0/np.cos(np.pi/2.0 - el)
     dateflo[i] = float(loc.date)
     datetim.append(loc.date.datetime())
